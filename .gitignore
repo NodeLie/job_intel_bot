@@ -1,0 +1,7 @@
+*.exe
+*.db
+.idea/
+prompts
+CLAUDE.md
+todo.md
+.env
