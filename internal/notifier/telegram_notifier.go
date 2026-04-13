@@ -4,6 +4,7 @@ package notifier
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"job-intel-bot/internal/domain"
@@ -19,12 +20,18 @@ func NewTelegramNotifier(bot *tgbotapi.BotAPI) *TelegramNotifier {
 	return &TelegramNotifier{bot: bot}
 }
 
-// Notify sends one message per job to the given chat ID.
-// It does not stop on individual send errors; all errors are collected and returned.
+// Notify sends jobs to the given chat in batches of up to 10 per message.
 func (n *TelegramNotifier) Notify(chatID int64, jobs []domain.Job) error {
+	const batchSize = 10
 	var errs []string
-	for _, j := range jobs {
-		text := formatJob(j)
+
+	for i := 0; i < len(jobs); i += batchSize {
+		end := i + batchSize
+		if end > len(jobs) {
+			end = len(jobs)
+		}
+		text := formatBatch(jobs[i:end], i)
+
 		msg := tgbotapi.NewMessage(chatID, text)
 		msg.ParseMode = tgbotapi.ModeHTML
 		msg.DisableWebPagePreview = true
@@ -33,30 +40,74 @@ func (n *TelegramNotifier) Notify(chatID int64, jobs []domain.Job) error {
 			errs = append(errs, fmt.Sprintf("send to %d: %v", chatID, err))
 		}
 	}
+
 	if len(errs) > 0 {
 		return fmt.Errorf("notifier: %s", strings.Join(errs, "; "))
 	}
 	return nil
 }
 
-// formatJob renders a domain.Job as an HTML Telegram message.
-func formatJob(j domain.Job) string {
+// formatBatch renders a slice of jobs as a single HTML message.
+// startIdx is the global offset used for numbering (0-based).
+func formatBatch(jobs []domain.Job, startIdx int) string {
+	var parts []string
+	for i, j := range jobs {
+		parts = append(parts, formatJob(startIdx+i+1, j))
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+// formatJob renders one vacancy as a compact HTML block.
+func formatJob(n int, j domain.Job) string {
 	var b strings.Builder
 
-	fmt.Fprintf(&b, "🆕 <b>%s</b>\n", escapeHTML(j.Title))
-	if j.Company != "" {
-		fmt.Fprintf(&b, "🏢 %s\n", escapeHTML(j.Company))
+	// Title + level
+	fmt.Fprintf(&b, "<b>%d. %s</b>", n, escapeHTML(j.Title))
+	if j.Level != "" {
+		fmt.Fprintf(&b, " · %s", levelLabel(j.Level))
 	}
+	b.WriteByte('\n')
+
+	// Company / location / work format — all on one line if present
+	var meta []string
+	if j.Company != "" {
+		meta = append(meta, "🏢 "+escapeHTML(j.Company))
+	}
+	if j.Location != "" {
+		meta = append(meta, "📍 "+escapeHTML(j.Location))
+	}
+	if j.WorkFormat != "" {
+		meta = append(meta, "💼 "+workFormatLabel(j.WorkFormat))
+	}
+	if len(meta) > 0 {
+		b.WriteString(strings.Join(meta, " · "))
+		b.WriteByte('\n')
+	}
+
+	// Salary
 	if j.Salary != nil {
 		fmt.Fprintf(&b, "💰 %s\n", formatSalary(j.Salary))
+	} else {
+		b.WriteString("💰 не указана\n")
 	}
-	if j.Level != "" {
-		fmt.Fprintf(&b, "📊 %s\n", j.Level)
+
+	// Publication date
+	if j.PostedAt != nil {
+		fmt.Fprintf(&b, "📅 %s\n", j.PostedAt.In(time.UTC).Format("02.01.2006"))
 	}
+
+	// Skills (first 5)
 	if len(j.Skills) > 0 {
-		fmt.Fprintf(&b, "🛠 %s\n", strings.Join(j.Skills, ", "))
+		skills := j.Skills
+		if len(skills) > 5 {
+			skills = skills[:5]
+		}
+		fmt.Fprintf(&b, "🔧 %s\n", strings.Join(skills, ", "))
+	} else {
+		b.WriteString("🔧 не указаны\n")
 	}
-	fmt.Fprintf(&b, "🔗 <a href=%q>Открыть вакансию</a>", j.URL)
+
+	fmt.Fprintf(&b, `<a href=%q>Открыть вакансию →</a>`, j.URL)
 
 	return b.String()
 }
@@ -71,6 +122,36 @@ func formatSalary(s *domain.Salary) string {
 		return fmt.Sprintf("до %d %s", s.Max, s.Currency)
 	default:
 		return "не указана"
+	}
+}
+
+func levelLabel(l domain.Level) string {
+	switch l {
+	case domain.LevelJunior:
+		return "Junior"
+	case domain.LevelMiddle:
+		return "Middle"
+	case domain.LevelSenior:
+		return "Senior"
+	default:
+		return string(l)
+	}
+}
+
+func workFormatLabel(wf string) string {
+	switch wf {
+	case "remote":
+		return "Удалённо"
+	case "fullDay":
+		return "Офис"
+	case "flexible":
+		return "Гибрид"
+	case "shift":
+		return "Сменный"
+	case "flyInFlyOut":
+		return "Вахта"
+	default:
+		return wf
 	}
 }
 

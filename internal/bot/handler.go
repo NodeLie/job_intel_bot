@@ -4,12 +4,15 @@ package bot
 import (
 	"fmt"
 	"log"
+	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"job-intel-bot/internal/domain"
+	"job-intel-bot/internal/parser"
 )
 
 // subscriptionRepository is the persistence interface required by the handler.
@@ -20,33 +23,98 @@ type subscriptionRepository interface {
 	SetActive(id int64, active bool) error
 }
 
-// Handler dispatches incoming Telegram commands.
+// wizardStep identifies the current step in the /add conversation wizard.
+type wizardStep int
+
+const (
+	stepSource         wizardStep = iota // choosing habr / hh
+	stepHHSetup                          // setup filters or skip
+	stepSpecialization                   // HH professional_role
+	stepExperience                       // HH experience
+	stepEmployment                       // HH employment type
+	stepWorkFormat                       // HH work format
+	stepRegion                           // HH region (awaits text input)
+	stepSearchField                      // HH search field
+)
+
+// wizardState holds the in-progress /add or /edit subscription being built.
+type wizardState struct {
+	keyword  string
+	filters  domain.Filter
+	msgID    int                  // message ID to edit on each wizard step
+	original *domain.Subscription // non-nil when editing; preserves ID, Active, CreatedAt
+}
+
+// hhSpecialization pairs a display label with a HH professional_role ID.
+type hhSpecialization struct {
+	Label string
+	ID    string
+}
+
+// hhSpecializations is a curated list of IT-relevant HH professional roles.
+// IDs verified from https://api.hh.ru/professional_roles.
+var hhSpecializations = []hhSpecialization{
+	{"💻 Разработка", "96"},
+	{"🧪 Тестирование", "124"},
+	{"⚙️ DevOps", "160"},
+	{"🤖 Data Science", "165"},
+	{"📊 Аналитика", "10"},
+	{"🔐 Инфобезопасность", "116"},
+	{"👥 Рук. разработки", "104"},
+	{"📦 Менеджер продукта", "73"},
+}
+
+// Handler dispatches incoming Telegram commands and wizard callbacks.
 type Handler struct {
-	bot   *tgbotapi.BotAPI
-	subs  subscriptionRepository
+	bot        *tgbotapi.BotAPI
+	subs       subscriptionRepository
+	httpClient *http.Client
+	states     sync.Map // map[int64]*wizardState
 }
 
-// New creates a Handler.
-func New(bot *tgbotapi.BotAPI, subs subscriptionRepository) *Handler {
-	return &Handler{bot: bot, subs: subs}
+// New creates a Handler. httpClient is used for HH area search requests.
+func New(bot *tgbotapi.BotAPI, subs subscriptionRepository, httpClient *http.Client) *Handler {
+	return &Handler{bot: bot, subs: subs, httpClient: httpClient}
 }
 
-// Dispatch routes an incoming update to the appropriate command handler.
+// Dispatch routes an incoming update to the appropriate handler.
 func (h *Handler) Dispatch(update tgbotapi.Update) {
-	if update.Message == nil || !update.Message.IsCommand() {
-		return
+	switch {
+	case update.CallbackQuery != nil:
+		h.handleCallback(update.CallbackQuery)
+
+	case update.Message != nil:
+		chatID := update.Message.Chat.ID
+		// If we're waiting for a text region input, intercept the message.
+		if v, ok := h.states.Load(chatID); ok {
+			state := v.(*wizardState)
+			if state.filters.AreaID == -1 { // sentinel: waiting for region text
+				h.handleRegionInput(update.Message, state)
+				return
+			}
+		}
+		if update.Message.IsCommand() {
+			h.handleCommand(update.Message)
+		}
 	}
+}
 
-	chatID := update.Message.Chat.ID
-	args := strings.TrimSpace(update.Message.CommandArguments())
+func (h *Handler) handleCommand(msg *tgbotapi.Message) {
+	chatID := msg.Chat.ID
+	args := strings.TrimSpace(msg.CommandArguments())
 
-	switch update.Message.Command() {
+	// Any new command cancels an in-progress wizard.
+	h.states.Delete(chatID)
+
+	switch msg.Command() {
 	case "start":
 		h.handleStart(chatID)
 	case "help":
 		h.handleHelp(chatID)
 	case "add":
 		h.handleAdd(chatID, args)
+	case "edit":
+		h.handleEdit(chatID, args)
 	case "list":
 		h.handleList(chatID)
 	case "remove":
@@ -62,6 +130,337 @@ func (h *Handler) Dispatch(update tgbotapi.Update) {
 	}
 }
 
+// ── Wizard ──────────────────────────────────────────────────────────────────
+
+// handleAdd starts the /add wizard by asking which source to use.
+func (h *Handler) handleAdd(chatID int64, args string) {
+	if args == "" {
+		h.reply(chatID, "Укажи ключевое слово. Пример: /add Go разработчик")
+		return
+	}
+
+	state := &wizardState{keyword: args}
+	h.states.Store(chatID, state)
+
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🔵 HeadHunter", "wiz:src:hh"),
+			tgbotapi.NewInlineKeyboardButtonData("🟠 Habr Career", "wiz:src:habr"),
+		),
+	)
+	msg := tgbotapi.NewMessage(chatID, fmt.Sprintf("Подписка на «<b>%s</b>»\n\nВыбери источник:", escapeHTML(args)))
+	msg.ParseMode = tgbotapi.ModeHTML
+	msg.ReplyMarkup = kb
+
+	sent, err := h.bot.Send(msg)
+	if err != nil {
+		log.Printf("bot: add wizard start: %v", err)
+		return
+	}
+	state.msgID = sent.MessageID
+}
+
+// handleCallback dispatches inline keyboard callbacks.
+func (h *Handler) handleCallback(query *tgbotapi.CallbackQuery) {
+	h.answerCallback(query.ID)
+
+	chatID := query.Message.Chat.ID
+	data := query.Data
+
+	// All wizard callbacks have the form "wiz:<field>:<value>"
+	if !strings.HasPrefix(data, "wiz:") {
+		return
+	}
+	parts := strings.SplitN(data, ":", 3)
+	if len(parts) != 3 {
+		return
+	}
+	field, value := parts[1], parts[2]
+
+	v, ok := h.states.Load(chatID)
+	if !ok {
+		h.editText(chatID, query.Message.MessageID, "Сессия устарела. Начни заново с /add.")
+		return
+	}
+	state := v.(*wizardState)
+	state.msgID = query.Message.MessageID
+
+	switch field {
+	case "src":
+		h.wizSource(chatID, state, value)
+	case "setup":
+		h.wizSetup(chatID, state, value)
+	case "spec":
+		h.wizSpecialization(chatID, state, value)
+	case "exp":
+		h.wizExperience(chatID, state, value)
+	case "emp":
+		h.wizEmployment(chatID, state, value)
+	case "fmt":
+		h.wizWorkFormat(chatID, state, value)
+	case "reg":
+		h.wizRegionSkip(chatID, state)
+	case "sf":
+		h.wizSearchField(chatID, state, value)
+	}
+}
+
+func (h *Handler) wizSource(chatID int64, state *wizardState, value string) {
+	switch value {
+	case "habr":
+		h.createSubscription(chatID, state, domain.SourceHabr)
+	case "hh":
+		h.editWithKeyboard(chatID, state.msgID,
+			fmt.Sprintf("Подписка на «<b>%s</b>» (HH)\n\nНастроить фильтры?", escapeHTML(state.keyword)),
+			tgbotapi.NewInlineKeyboardMarkup(
+				tgbotapi.NewInlineKeyboardRow(
+					tgbotapi.NewInlineKeyboardButtonData("⚙️ Настроить фильтры", "wiz:setup:yes"),
+					tgbotapi.NewInlineKeyboardButtonData("⚡ Создать без фильтров", "wiz:setup:no"),
+				),
+			),
+		)
+	}
+}
+
+func (h *Handler) wizSetup(chatID int64, state *wizardState, value string) {
+	switch value {
+	case "no":
+		h.createSubscription(chatID, state, domain.SourceHH)
+	case "cancel":
+		h.states.Delete(chatID)
+		h.editText(chatID, state.msgID, "✏️ Редактирование отменено.")
+	default: // "yes"
+		h.showSpecializationStep(chatID, state)
+	}
+}
+
+func (h *Handler) showSpecializationStep(chatID int64, state *wizardState) {
+	rows := [][]tgbotapi.InlineKeyboardButton{}
+	for i := 0; i < len(hhSpecializations); i += 2 {
+		row := []tgbotapi.InlineKeyboardButton{
+			tgbotapi.NewInlineKeyboardButtonData(
+				hhSpecializations[i].Label, "wiz:spec:"+hhSpecializations[i].ID),
+		}
+		if i+1 < len(hhSpecializations) {
+			row = append(row, tgbotapi.NewInlineKeyboardButtonData(
+				hhSpecializations[i+1].Label, "wiz:spec:"+hhSpecializations[i+1].ID))
+		}
+		rows = append(rows, row)
+	}
+	rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+		tgbotapi.NewInlineKeyboardButtonData("Пропустить →", "wiz:spec:skip"),
+	))
+	prompt := "Специализация:"
+	if state.filters.Specialization != "" {
+		prompt += "\nТекущая: " + specializationLabel(state.filters.Specialization)
+	}
+	h.editWithKeyboard(chatID, state.msgID, prompt, tgbotapi.NewInlineKeyboardMarkup(rows...))
+}
+
+func (h *Handler) wizSpecialization(chatID int64, state *wizardState, value string) {
+	if value == "skip" {
+		state.filters.Specialization = ""
+	} else {
+		state.filters.Specialization = value
+	}
+	prompt := "Опыт работы:"
+	if state.filters.Experience != "" {
+		prompt += "\nТекущий: " + experienceLabel(state.filters.Experience)
+	}
+	h.editWithKeyboard(chatID, state.msgID, prompt,
+		tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("Без опыта", "wiz:exp:noExperience"),
+				tgbotapi.NewInlineKeyboardButtonData("1–3 года", "wiz:exp:between1And3"),
+			),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("3–6 лет", "wiz:exp:between3And6"),
+				tgbotapi.NewInlineKeyboardButtonData("6+ лет", "wiz:exp:moreThan6"),
+			),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("Пропустить →", "wiz:exp:skip"),
+			),
+		),
+	)
+}
+
+func (h *Handler) wizExperience(chatID int64, state *wizardState, value string) {
+	if value == "skip" {
+		state.filters.Experience = ""
+	} else {
+		state.filters.Experience = value
+	}
+	prompt := "Тип занятости:"
+	if state.filters.Employment != "" {
+		prompt += "\nТекущий: " + employmentLabel(state.filters.Employment)
+	}
+	h.editWithKeyboard(chatID, state.msgID, prompt,
+		tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("Полная", "wiz:emp:full"),
+				tgbotapi.NewInlineKeyboardButtonData("Частичная", "wiz:emp:part"),
+			),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("Проектная", "wiz:emp:project"),
+				tgbotapi.NewInlineKeyboardButtonData("Стажировка", "wiz:emp:probation"),
+			),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("Пропустить →", "wiz:emp:skip"),
+			),
+		),
+	)
+}
+
+func (h *Handler) wizEmployment(chatID int64, state *wizardState, value string) {
+	if value == "skip" {
+		state.filters.Employment = ""
+	} else {
+		state.filters.Employment = value
+	}
+	prompt := "Формат работы:"
+	if state.filters.WorkFormat != "" {
+		prompt += "\nТекущий: " + workFormatWizLabel(state.filters.WorkFormat)
+	}
+	h.editWithKeyboard(chatID, state.msgID, prompt,
+		tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("💻 Удалённо", "wiz:fmt:REMOTE"),
+				tgbotapi.NewInlineKeyboardButtonData("🏢 Офис", "wiz:fmt:ONSITE"),
+			),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("🔀 Гибрид", "wiz:fmt:HYBRID"),
+				tgbotapi.NewInlineKeyboardButtonData("Пропустить →", "wiz:fmt:skip"),
+			),
+		),
+	)
+}
+
+func (h *Handler) wizWorkFormat(chatID int64, state *wizardState, value string) {
+	if value == "skip" {
+		state.filters.WorkFormat = ""
+	} else {
+		state.filters.WorkFormat = value
+	}
+	// Use sentinel -1 to signal "waiting for region text input"
+	state.filters.AreaID = -1
+	prompt := "Регион:\nВведи название города в чат или нажми «Пропустить»."
+	if state.filters.AreaName != "" {
+		prompt = fmt.Sprintf("Регион:\nТекущий: %s\nВведи новое название или нажми «Пропустить» чтобы сбросить.", escapeHTML(state.filters.AreaName))
+	}
+	h.editWithKeyboard(chatID, state.msgID, prompt,
+		tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("Пропустить →", "wiz:reg:skip"),
+			),
+		),
+	)
+}
+
+func (h *Handler) wizRegionSkip(chatID int64, state *wizardState) {
+	state.filters.AreaID = 0
+	state.filters.AreaName = ""
+	h.showSearchFieldStep(chatID, state)
+}
+
+func (h *Handler) handleRegionInput(msg *tgbotapi.Message, state *wizardState) {
+	chatID := msg.Chat.ID
+	query := strings.TrimSpace(msg.Text)
+
+	// Delete the user's message to keep chat tidy (best-effort)
+	h.bot.Request(tgbotapi.NewDeleteMessage(chatID, msg.MessageID)) //nolint:errcheck
+
+	id, name, err := parser.SearchArea(h.httpClient, query)
+	if err != nil {
+		log.Printf("bot: search area %q: %v", query, err)
+		h.editText(chatID, state.msgID, "Ошибка поиска региона, попробуй ещё раз или нажми Пропустить.")
+		return
+	}
+	if id == 0 {
+		h.editText(chatID, state.msgID,
+			fmt.Sprintf("Регион «%s» не найден. Попробуй другое название или нажми Пропустить.",
+				escapeHTML(query)))
+		// Re-show skip button
+		kb := tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("Пропустить →", "wiz:reg:skip"),
+			),
+		)
+		edit := tgbotapi.NewEditMessageReplyMarkup(chatID, state.msgID, kb)
+		h.bot.Request(edit) //nolint:errcheck
+		return
+	}
+
+	state.filters.AreaID = id
+	state.filters.AreaName = name
+	h.showSearchFieldStep(chatID, state)
+}
+
+func (h *Handler) showSearchFieldStep(chatID int64, state *wizardState) {
+	prompt := "Где искать ключевые слова?"
+	if state.filters.SearchField != "" {
+		prompt += "\nТекущее: " + searchFieldLabel(state.filters.SearchField)
+	}
+	h.editWithKeyboard(chatID, state.msgID, prompt,
+		tgbotapi.NewInlineKeyboardMarkup(
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("В названии вакансии", "wiz:sf:name"),
+				tgbotapi.NewInlineKeyboardButtonData("В описании", "wiz:sf:description"),
+			),
+			tgbotapi.NewInlineKeyboardRow(
+				tgbotapi.NewInlineKeyboardButtonData("В названии компании", "wiz:sf:company_name"),
+				tgbotapi.NewInlineKeyboardButtonData("Везде (по умолчанию)", "wiz:sf:skip"),
+			),
+		),
+	)
+}
+
+func (h *Handler) wizSearchField(chatID int64, state *wizardState, value string) {
+	if value == "skip" {
+		state.filters.SearchField = ""
+	} else {
+		state.filters.SearchField = value
+	}
+	h.createSubscription(chatID, state, domain.SourceHH)
+}
+
+// createSubscription saves (or updates) the subscription and clears the wizard state.
+func (h *Handler) createSubscription(chatID int64, state *wizardState, source domain.Source) {
+	h.states.Delete(chatID)
+
+	var sub domain.Subscription
+	if state.original != nil {
+		// Edit mode: preserve ID, UserID, Active, CreatedAt — only update filters.
+		sub = *state.original
+		sub.Filters = state.filters
+	} else {
+		sub = domain.Subscription{
+			UserID:    chatID,
+			Keyword:   state.keyword,
+			Source:    source,
+			Filters:   state.filters,
+			Active:    true,
+			CreatedAt: time.Now(),
+		}
+	}
+
+	if err := h.subs.Save(&sub); err != nil {
+		log.Printf("bot: save sub user %d: %v", chatID, err)
+		h.editText(chatID, state.msgID, "Не удалось сохранить подписку, попробуй ещё раз.")
+		return
+	}
+
+	var text string
+	if state.original != nil {
+		text = fmt.Sprintf("✅ Подписка #%d обновлена!", sub.ID)
+	} else {
+		text = fmt.Sprintf("✅ Подписка #%d добавлена!\n📌 «%s» на %s",
+			sub.ID, escapeHTML(sub.Keyword), sub.Source)
+	}
+	h.editText(chatID, state.msgID, text)
+}
+
+// ── Commands ─────────────────────────────────────────────────────────────────
+
 func (h *Handler) handleStart(chatID int64) {
 	h.reply(chatID, "👋 Привет! Я слежу за вакансиями на Habr Career и HeadHunter.\n\n"+
 		"Используй /add чтобы добавить подписку, /help чтобы увидеть все команды.")
@@ -69,62 +468,15 @@ func (h *Handler) handleStart(chatID int64) {
 
 func (h *Handler) handleHelp(chatID int64) {
 	h.reply(chatID,
-		"/add <ключевое слово> [habr|hh]  — добавить подписку\n"+
-			"/list                           — список подписок\n"+
-			"/remove <id>                    — удалить подписку\n"+
-			"/pause <id>                     — приостановить\n"+
-			"/resume <id>                    — возобновить\n"+
-			"/status                         — сводка\n"+
-			"/help                           — эта справка",
+		"/add <ключевое слово>  — добавить подписку (запустит wizard выбора источника)\n"+
+			"/edit <id>             — изменить фильтры подписки\n"+
+			"/list                  — список подписок\n"+
+			"/remove <id>           — удалить подписку\n"+
+			"/pause <id>            — приостановить\n"+
+			"/resume <id>           — возобновить\n"+
+			"/status                — сводка\n"+
+			"/help                  — эта справка",
 	)
-}
-
-// handleAdd parses "/add <keyword> [source]" and creates a new subscription.
-// Examples:
-//
-//	/add Go разработчик
-//	/add Go разработчик hh
-func (h *Handler) handleAdd(chatID int64, args string) {
-	if args == "" {
-		h.reply(chatID, "Укажи ключевое слово. Пример: /add Go разработчик hh")
-		return
-	}
-
-	parts := strings.Fields(args)
-	source := domain.SourceHabr
-	keyword := args
-
-	// If the last token is a known source identifier, use it.
-	if len(parts) > 1 {
-		last := strings.ToLower(parts[len(parts)-1])
-		switch last {
-		case "hh":
-			source = domain.SourceHH
-			keyword = strings.Join(parts[:len(parts)-1], " ")
-		case "habr":
-			source = domain.SourceHabr
-			keyword = strings.Join(parts[:len(parts)-1], " ")
-		}
-	}
-
-	sub := &domain.Subscription{
-		UserID:    chatID,
-		Keyword:   keyword,
-		Source:    source,
-		Active:    true,
-		CreatedAt: time.Now(),
-	}
-
-	if err := h.subs.Save(sub); err != nil {
-		log.Printf("bot: save sub user %d: %v", chatID, err)
-		h.reply(chatID, "Не удалось сохранить подписку, попробуй ещё раз.")
-		return
-	}
-
-	h.reply(chatID, fmt.Sprintf(
-		"✅ Подписка #%d добавлена:\n📌 «%s» на %s",
-		sub.ID, sub.Keyword, sub.Source,
-	))
 }
 
 func (h *Handler) handleList(chatID int64) {
@@ -147,7 +499,11 @@ func (h *Handler) handleList(chatID int64) {
 		if !s.Active {
 			status = "⏸"
 		}
-		fmt.Fprintf(&b, "%s #%d — «%s» (%s)\n", status, s.ID, s.Keyword, s.Source)
+		fmt.Fprintf(&b, "%s #%d — «%s» (%s)", status, s.ID, escapeHTML(s.Keyword), s.Source)
+		if s.Filters.AreaName != "" {
+			fmt.Fprintf(&b, " · 📍%s", escapeHTML(s.Filters.AreaName))
+		}
+		b.WriteByte('\n')
 	}
 
 	msg := tgbotapi.NewMessage(chatID, b.String())
@@ -163,13 +519,11 @@ func (h *Handler) handleRemove(chatID int64, args string) {
 		h.reply(chatID, "Укажи ID подписки. Пример: /remove 3")
 		return
 	}
-
 	if err := h.subs.Delete(id); err != nil {
 		log.Printf("bot: delete sub %d user %d: %v", id, chatID, err)
 		h.reply(chatID, "Не удалось удалить подписку.")
 		return
 	}
-
 	h.reply(chatID, fmt.Sprintf("🗑 Подписка #%d удалена.", id))
 }
 
@@ -183,18 +537,75 @@ func (h *Handler) handleSetActive(chatID int64, args string, active bool) {
 		}
 		return
 	}
-
 	if err := h.subs.SetActive(id, active); err != nil {
 		log.Printf("bot: set_active sub %d user %d: %v", id, chatID, err)
 		h.reply(chatID, "Не удалось обновить подписку.")
 		return
 	}
-
 	if active {
 		h.reply(chatID, fmt.Sprintf("▶️ Подписка #%d возобновлена.", id))
 	} else {
 		h.reply(chatID, fmt.Sprintf("⏸ Подписка #%d приостановлена.", id))
 	}
+}
+
+func (h *Handler) handleEdit(chatID int64, args string) {
+	id, ok := parseID(args)
+	if !ok {
+		h.reply(chatID, "Укажи ID подписки. Пример: /edit 3")
+		return
+	}
+
+	subs, err := h.subs.ListByUser(chatID)
+	if err != nil {
+		log.Printf("bot: edit list subs user %d: %v", chatID, err)
+		h.reply(chatID, "Не удалось загрузить подписки.")
+		return
+	}
+
+	var found *domain.Subscription
+	for i := range subs {
+		if subs[i].ID == id {
+			found = &subs[i]
+			break
+		}
+	}
+	if found == nil {
+		h.reply(chatID, fmt.Sprintf("Подписка #%d не найдена.", id))
+		return
+	}
+	if found.Source == domain.SourceHabr {
+		h.reply(chatID, "У Habr-подписок нет настраиваемых фильтров.")
+		return
+	}
+
+	state := &wizardState{
+		keyword:  found.Keyword,
+		filters:  found.Filters,
+		original: found,
+	}
+	h.states.Store(chatID, state)
+
+	text := fmt.Sprintf(
+		"✏️ Редактирование подписки #%d «<b>%s</b>» (HH)\n\nТекущие фильтры:\n%s\nПерейти к настройке:",
+		id, escapeHTML(found.Keyword), formatFilters(found.Filters),
+	)
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("⚙️ Перенастроить фильтры", "wiz:setup:yes"),
+			tgbotapi.NewInlineKeyboardButtonData("❌ Отмена", "wiz:setup:cancel"),
+		),
+	)
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = tgbotapi.ModeHTML
+	msg.ReplyMarkup = kb
+
+	sent, err := h.bot.Send(msg)
+	if err != nil {
+		log.Printf("bot: edit wizard start: %v", err)
+		return
+	}
+	state.msgID = sent.MessageID
 }
 
 func (h *Handler) handleStatus(chatID int64) {
@@ -203,25 +614,56 @@ func (h *Handler) handleStatus(chatID int64) {
 		h.reply(chatID, "Не удалось получить статус.")
 		return
 	}
-
 	active := 0
 	for _, s := range subs {
 		if s.Active {
 			active++
 		}
 	}
-
 	h.reply(chatID, fmt.Sprintf(
 		"📊 Всего подписок: %d\nАктивных: %d\nПриостановленных: %d",
 		len(subs), active, len(subs)-active,
 	))
 }
 
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
 func (h *Handler) reply(chatID int64, text string) {
 	msg := tgbotapi.NewMessage(chatID, text)
 	if _, err := h.bot.Send(msg); err != nil {
 		log.Printf("bot: reply to %d: %v", chatID, err)
 	}
+}
+
+func (h *Handler) editText(chatID int64, msgID int, text string) {
+	edit := tgbotapi.NewEditMessageText(chatID, msgID, text)
+	edit.ParseMode = tgbotapi.ModeHTML
+	if _, err := h.bot.Request(edit); err != nil {
+		log.Printf("bot: edit message %d: %v", msgID, err)
+	}
+}
+
+func (h *Handler) editWithKeyboard(chatID int64, msgID int, text string, kb tgbotapi.InlineKeyboardMarkup) {
+	edit := tgbotapi.NewEditMessageText(chatID, msgID, text)
+	edit.ParseMode = tgbotapi.ModeHTML
+	edit.ReplyMarkup = &kb
+	if _, err := h.bot.Request(edit); err != nil {
+		log.Printf("bot: edit message %d: %v", msgID, err)
+	}
+}
+
+func (h *Handler) answerCallback(id string) {
+	cb := tgbotapi.NewCallback(id, "")
+	if _, err := h.bot.Request(cb); err != nil {
+		log.Printf("bot: answer callback: %v", err)
+	}
+}
+
+func escapeHTML(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	return s
 }
 
 func parseID(s string) (int64, bool) {
@@ -231,4 +673,96 @@ func parseID(s string) (int64, bool) {
 		return 0, false
 	}
 	return id, true
+}
+
+// formatFilters renders the non-zero fields of a Filter as a bullet list.
+func formatFilters(f domain.Filter) string {
+	var b strings.Builder
+	if f.Specialization != "" {
+		fmt.Fprintf(&b, "• Специализация: %s\n", specializationLabel(f.Specialization))
+	}
+	if f.Experience != "" {
+		fmt.Fprintf(&b, "• Опыт: %s\n", experienceLabel(f.Experience))
+	}
+	if f.Employment != "" {
+		fmt.Fprintf(&b, "• Занятость: %s\n", employmentLabel(f.Employment))
+	}
+	if f.WorkFormat != "" {
+		fmt.Fprintf(&b, "• Формат: %s\n", workFormatWizLabel(f.WorkFormat))
+	}
+	if f.AreaName != "" {
+		fmt.Fprintf(&b, "• Регион: %s\n", f.AreaName)
+	}
+	if f.SearchField != "" {
+		fmt.Fprintf(&b, "• Поиск: %s\n", searchFieldLabel(f.SearchField))
+	}
+	if b.Len() == 0 {
+		return "не заданы\n"
+	}
+	return b.String()
+}
+
+func specializationLabel(id string) string {
+	for _, s := range hhSpecializations {
+		if s.ID == id {
+			return s.Label
+		}
+	}
+	return id
+}
+
+func experienceLabel(v string) string {
+	switch v {
+	case "noExperience":
+		return "Без опыта"
+	case "between1And3":
+		return "1–3 года"
+	case "between3And6":
+		return "3–6 лет"
+	case "moreThan6":
+		return "6+ лет"
+	default:
+		return v
+	}
+}
+
+func employmentLabel(v string) string {
+	switch v {
+	case "full":
+		return "Полная"
+	case "part":
+		return "Частичная"
+	case "project":
+		return "Проектная"
+	case "probation":
+		return "Стажировка"
+	default:
+		return v
+	}
+}
+
+func workFormatWizLabel(v string) string {
+	switch v {
+	case "REMOTE":
+		return "Удалённо"
+	case "ONSITE":
+		return "Офис"
+	case "HYBRID":
+		return "Гибрид"
+	default:
+		return v
+	}
+}
+
+func searchFieldLabel(v string) string {
+	switch v {
+	case "name":
+		return "В названии вакансии"
+	case "description":
+		return "В описании"
+	case "company_name":
+		return "В названии компании"
+	default:
+		return v
+	}
 }

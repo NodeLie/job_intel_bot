@@ -25,4 +25,9 @@ type Filter struct {
 	OnlyWithSalary bool   // hh-only: exclude vacancies without stated salary
 	SearchPeriod   int    // hh-only: 0 | 1 | 3 | 7 | 14 | 30 days
 	OrderBy        string // hh-only: relevance | publication_time | salary_desc | salary_asc
+	Specialization string // hh-only: professional_role ID (e.g. "96" = Программист)
+	Employment     string // hh-only: full | part | project | volunteer | probation
+	AreaID         int    // hh-only: area ID from HH API (0 = not set)
+	AreaName       string // hh-only: human-readable area name, stored for display
+	SearchField    string // hh-only: name | company_name | description (empty = all fields)
 }

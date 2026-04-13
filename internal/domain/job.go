@@ -40,6 +40,8 @@ type Job struct {
 	Description string
 	Skills      []string
 	Level       Level
+	Location    string     // city/region, empty when not provided by the source
+	WorkFormat  string     // HH schedule ID: remote|fullDay|flexible|shift|flyInFlyOut
 	Source      Source
 	URL         string
 	Fingerprint string     // 16-char SHA-256 hex prefix, used for deduplication
