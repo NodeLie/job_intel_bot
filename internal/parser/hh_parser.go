@@ -15,8 +15,8 @@ import (
 )
 
 const (
-	hhAPIBase                = "https://api.hh.ru"
-	maxConcurrentHHFetches   = 8
+	hhAPIBase              = "https://api.hh.ru"
+	maxConcurrentHHFetches = 8
 )
 
 // HHFilters holds optional search parameters for the HeadHunter API.
@@ -28,6 +28,10 @@ type HHFilters struct {
 	OnlyWithSalary bool
 	SearchPeriod   int    // 0 | 1 | 3 | 7 | 14 | 30 days
 	OrderBy        string // relevance | publication_time | salary_desc | salary_asc
+	Specialization string // professional_role ID (e.g. "96")
+	Employment     string // full | part | project | volunteer | probation
+	AreaID         int    // HH area ID (0 = not set)
+	SearchField    string // name | company_name | description (empty = all)
 }
 
 // HHParser fetches vacancies from the HeadHunter public API.
@@ -99,10 +103,10 @@ func (p *HHParser) Parse() ([]domain.Job, error) {
 
 // hhVacancy is the list-endpoint response shape.
 type hhVacancy struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
+	ID           string `json:"id"`
+	Name         string `json:"name"`
 	AlternateURL string `json:"alternate_url"`
-	Employer   struct {
+	Employer     struct {
 		Name string `json:"name"`
 	} `json:"employer"`
 	Salary *struct {
@@ -113,6 +117,13 @@ type hhVacancy struct {
 	Experience struct {
 		ID string `json:"id"`
 	} `json:"experience"`
+	Schedule struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	} `json:"schedule"`
+	Area struct {
+		Name string `json:"name"`
+	} `json:"area"`
 	PublishedAt string `json:"published_at"`
 }
 
@@ -149,6 +160,18 @@ func (p *HHParser) fetchList(page int) ([]hhVacancy, error) {
 	}
 	if p.filters.OrderBy != "" {
 		q.Set("order_by", p.filters.OrderBy)
+	}
+	if p.filters.Specialization != "" {
+		q.Set("professional_role", p.filters.Specialization)
+	}
+	if p.filters.Employment != "" {
+		q.Set("employment", p.filters.Employment)
+	}
+	if p.filters.AreaID != 0 {
+		q.Set("area", strconv.Itoa(p.filters.AreaID))
+	}
+	if p.filters.SearchField != "" {
+		q.Set("search_field", p.filters.SearchField)
 	}
 
 	rawURL := hhAPIBase + "/vacancies?" + q.Encode()
@@ -190,6 +213,8 @@ func (p *HHParser) toJob(v hhVacancy) domain.Job {
 		URL:         v.AlternateURL,
 		Source:      domain.SourceHH,
 		Level:       mapLevel(v.Experience.ID),
+		Location:    v.Area.Name,
+		WorkFormat:  v.Schedule.ID,
 		CollectedAt: time.Now(),
 	}
 	j.Fingerprint = fingerprint(j.Title, j.Company, j.URL)
@@ -203,13 +228,48 @@ func (p *HHParser) toJob(v hhVacancy) domain.Job {
 	}
 
 	if v.PublishedAt != "" {
+		// HH API returns dates as "2006-01-02T15:04:05+0700" (no colon in offset).
+		// Try RFC3339 first, then the colon-less variant.
 		t, err := time.Parse(time.RFC3339, v.PublishedAt)
+		if err != nil {
+			t, err = time.Parse("2006-01-02T15:04:05-0700", v.PublishedAt)
+		}
 		if err == nil {
 			j.PostedAt = &t
 		}
 	}
 
 	return j
+}
+
+// SearchArea finds the first HH area matching the query text using the suggests API.
+// Returns (0, "", nil) when no match is found.
+func SearchArea(client *http.Client, query string) (int, string, error) {
+	rawURL := hhAPIBase + "/suggests/areas?text=" + url.QueryEscape(query)
+	resp, err := client.Get(rawURL)
+	if err != nil {
+		return 0, "", fmt.Errorf("hh: search area: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Items []struct {
+			ID   string `json:"id"`
+			Text string `json:"text"`
+		} `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return 0, "", fmt.Errorf("hh: decode area suggestions: %w", err)
+	}
+	if len(result.Items) == 0 {
+		return 0, "", nil
+	}
+
+	id, err := strconv.Atoi(result.Items[0].ID)
+	if err != nil {
+		return 0, "", fmt.Errorf("hh: parse area id %q: %w", result.Items[0].ID, err)
+	}
+	return id, result.Items[0].Text, nil
 }
 
 func mapLevel(experienceID string) domain.Level {

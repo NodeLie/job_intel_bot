@@ -1,0 +1,35 @@
+# Job Intel Bot — example configuration.
+# Copy to config.yaml and fill in your values.
+# Values here can also be overridden via environment variables (see below).
+
+# Required: Telegram Bot API token.
+# Env: BOT_TOKEN
+bot_token: "YOUR_TELEGRAM_BOT_TOKEN"
+
+# Optional: path to the SQLite database file.
+# Env: DB_PATH
+# Default: ./job-intel-bot.db
+db_path: "./job-intel-bot.db"
+
+# Optional: legacy JSON paths (used by JSONRepository, not the SQLite backend).
+# Env: SUBS_PATH / SEEN_PATH
+# subs_path: "subscriptions.json"
+# seen_path: "seen_jobs.json"
+
+# Optional: how often to check for new vacancies.
+# Valid Go duration string: 30m, 1h, 2h30m, etc.
+# Env: POLL_INTERVAL
+# Default: 30m
+poll_interval: "30m"
+
+# Optional: log verbosity level.
+# Env: LOG_LEVEL
+# Values: debug | info | warn | error
+# Default: info
+log_level: "info"
+
+# Optional: HTTP proxy for Telegram API requests.
+# Supported schemes: http, https, socks5.
+# Env: PROXY_URL
+# Example: "socks5://user:pass@127.0.0.1:1080"
+# proxy_url: ""
