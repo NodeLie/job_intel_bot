@@ -53,15 +53,11 @@ func NewHHParser(client *http.Client, query string, pages int, filters HHFilters
 	return &HHParser{client: client, query: query, pages: pages, filters: filters}
 }
 
-// Parse fetches all configured pages then enriches each job with its full description.
+// Parse fetches the first page of results then enriches each job with its full description.
 func (p *HHParser) Parse() ([]domain.Job, error) {
-	var vacancies []hhVacancy
-	for page := 0; page < p.pages; page++ {
-		batch, err := p.fetchList(page)
-		if err != nil {
-			return nil, fmt.Errorf("hh: fetch page %d: %w", page, err)
-		}
-		vacancies = append(vacancies, batch...)
+	vacancies, err := p.fetchList(0)
+	if err != nil {
+		return nil, fmt.Errorf("hh: fetch page 0: %w", err)
 	}
 
 	jobs := make([]domain.Job, len(vacancies))
@@ -139,7 +135,7 @@ func (p *HHParser) fetchList(page int) ([]hhVacancy, error) {
 	q := url.Values{}
 	q.Set("text", p.query)
 	q.Set("page", strconv.Itoa(page))
-	q.Set("per_page", "20")
+	q.Set("per_page", "50")
 	if p.filters.Experience != "" {
 		q.Set("experience", p.filters.Experience)
 	}
@@ -158,9 +154,11 @@ func (p *HHParser) fetchList(page int) ([]hhVacancy, error) {
 	if p.filters.SearchPeriod > 0 {
 		q.Set("search_period", strconv.Itoa(p.filters.SearchPeriod))
 	}
-	if p.filters.OrderBy != "" {
-		q.Set("order_by", p.filters.OrderBy)
+	orderBy := p.filters.OrderBy
+	if orderBy == "" {
+		orderBy = "publication_time"
 	}
+	q.Set("order_by", orderBy)
 	if p.filters.Specialization != "" {
 		q.Set("professional_role", p.filters.Specialization)
 	}
