@@ -165,7 +165,49 @@ func (h *Handler) handleCallback(query *tgbotapi.CallbackQuery) {
 	h.answerCallback(query.ID)
 
 	chatID := query.Message.Chat.ID
+	msgID := query.Message.MessageID
 	data := query.Data
+
+	// Subscription picker callbacks have the form "sel:<action>[:<id>]"
+	if strings.HasPrefix(data, "sel:") {
+		parts := strings.SplitN(data, ":", 3)
+		if len(parts) < 2 {
+			return
+		}
+		action := parts[1]
+		switch action {
+		case "cancel":
+			h.editText(chatID, msgID, "Отменено.")
+		case "edit":
+			if len(parts) != 3 {
+				return
+			}
+			id, err := strconv.ParseInt(parts[2], 10, 64)
+			if err != nil || id <= 0 {
+				return
+			}
+			h.selEdit(chatID, msgID, id)
+		case "rm":
+			if len(parts) != 3 {
+				return
+			}
+			id, err := strconv.ParseInt(parts[2], 10, 64)
+			if err != nil || id <= 0 {
+				return
+			}
+			h.selRemove(chatID, msgID, id)
+		case "rm_ok":
+			if len(parts) != 3 {
+				return
+			}
+			id, err := strconv.ParseInt(parts[2], 10, 64)
+			if err != nil || id <= 0 {
+				return
+			}
+			h.selRemoveOK(chatID, msgID, id)
+		}
+		return
+	}
 
 	// All wizard callbacks have the form "wiz:<field>:<value>"
 	if !strings.HasPrefix(data, "wiz:") {
@@ -179,11 +221,11 @@ func (h *Handler) handleCallback(query *tgbotapi.CallbackQuery) {
 
 	v, ok := h.states.Load(chatID)
 	if !ok {
-		h.editText(chatID, query.Message.MessageID, "Сессия устарела. Начни заново с /add.")
+		h.editText(chatID, msgID, "Сессия устарела. Начни заново с /add.")
 		return
 	}
 	state := v.(*wizardState)
-	state.msgID = query.Message.MessageID
+	state.msgID = msgID
 
 	switch field {
 	case "src":
@@ -469,9 +511,9 @@ func (h *Handler) handleStart(chatID int64) {
 func (h *Handler) handleHelp(chatID int64) {
 	h.reply(chatID,
 		"/add <ключевое слово>  — добавить подписку (запустит wizard выбора источника)\n"+
-			"/edit <id>             — изменить фильтры подписки\n"+
+			"/edit                  — изменить фильтры подписки\n"+
 			"/list                  — список подписок\n"+
-			"/remove <id>           — удалить подписку\n"+
+			"/remove                — удалить подписку\n"+
 			"/pause <id>            — приостановить\n"+
 			"/resume <id>           — возобновить\n"+
 			"/status                — сводка\n"+
@@ -513,18 +555,84 @@ func (h *Handler) handleList(chatID int64) {
 	}
 }
 
-func (h *Handler) handleRemove(chatID int64, args string) {
-	id, ok := parseID(args)
-	if !ok {
-		h.reply(chatID, "Укажи ID подписки. Пример: /remove 3")
+func (h *Handler) handleRemove(chatID int64, _ string) {
+	subs, err := h.subs.ListByUser(chatID)
+	if err != nil {
+		log.Printf("bot: remove list subs user %d: %v", chatID, err)
+		h.reply(chatID, "Не удалось загрузить подписки.")
 		return
 	}
+	if len(subs) == 0 {
+		h.reply(chatID, "У тебя нет подписок.")
+		return
+	}
+
+	msg := tgbotapi.NewMessage(chatID, "🗑 Выбери подписку для удаления:")
+	msg.ReplyMarkup = buildSubPickerKeyboard(subs, "sel:rm")
+	if _, err := h.bot.Send(msg); err != nil {
+		log.Printf("bot: remove picker send user %d: %v", chatID, err)
+	}
+}
+
+// selRemove is invoked when the user taps a subscription in the remove picker.
+// It shows a confirmation dialog before deleting.
+func (h *Handler) selRemove(chatID int64, msgID int, id int64) {
+	subs, err := h.subs.ListByUser(chatID)
+	if err != nil {
+		log.Printf("bot: sel_remove list subs user %d: %v", chatID, err)
+		h.editText(chatID, msgID, "Не удалось загрузить подписки.")
+		return
+	}
+
+	var found *domain.Subscription
+	for i := range subs {
+		if subs[i].ID == id {
+			found = &subs[i]
+			break
+		}
+	}
+	if found == nil {
+		h.editText(chatID, msgID, fmt.Sprintf("Подписка #%d не найдена.", id))
+		return
+	}
+
+	text := fmt.Sprintf("Удалить подписку #%d «<b>%s</b>»?", id, escapeHTML(found.Keyword))
+	kb := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🗑 Да, удалить", fmt.Sprintf("sel:rm_ok:%d", id)),
+			tgbotapi.NewInlineKeyboardButtonData("↩️ Отмена", "sel:cancel"),
+		),
+	)
+	h.editWithKeyboard(chatID, msgID, text, kb)
+}
+
+// selRemoveOK is invoked when the user confirms deletion.
+func (h *Handler) selRemoveOK(chatID int64, msgID int, id int64) {
+	// Verify ownership before deleting.
+	subs, err := h.subs.ListByUser(chatID)
+	if err != nil {
+		log.Printf("bot: sel_remove_ok list subs user %d: %v", chatID, err)
+		h.editText(chatID, msgID, "Не удалось загрузить подписки.")
+		return
+	}
+	var owned bool
+	for _, s := range subs {
+		if s.ID == id {
+			owned = true
+			break
+		}
+	}
+	if !owned {
+		h.editText(chatID, msgID, fmt.Sprintf("Подписка #%d не найдена.", id))
+		return
+	}
+
 	if err := h.subs.Delete(id); err != nil {
-		log.Printf("bot: delete sub %d user %d: %v", id, chatID, err)
-		h.reply(chatID, "Не удалось удалить подписку.")
+		log.Printf("bot: sel_remove_ok delete sub %d user %d: %v", id, chatID, err)
+		h.editText(chatID, msgID, "Не удалось удалить подписку.")
 		return
 	}
-	h.reply(chatID, fmt.Sprintf("🗑 Подписка #%d удалена.", id))
+	h.editText(chatID, msgID, fmt.Sprintf("🗑 Подписка #%d удалена.", id))
 }
 
 func (h *Handler) handleSetActive(chatID int64, args string, active bool) {
@@ -549,17 +657,31 @@ func (h *Handler) handleSetActive(chatID int64, args string, active bool) {
 	}
 }
 
-func (h *Handler) handleEdit(chatID int64, args string) {
-	id, ok := parseID(args)
-	if !ok {
-		h.reply(chatID, "Укажи ID подписки. Пример: /edit 3")
-		return
-	}
-
+func (h *Handler) handleEdit(chatID int64, _ string) {
 	subs, err := h.subs.ListByUser(chatID)
 	if err != nil {
 		log.Printf("bot: edit list subs user %d: %v", chatID, err)
 		h.reply(chatID, "Не удалось загрузить подписки.")
+		return
+	}
+	if len(subs) == 0 {
+		h.reply(chatID, "У тебя нет подписок.")
+		return
+	}
+
+	msg := tgbotapi.NewMessage(chatID, "✏️ Выбери подписку для редактирования:")
+	msg.ReplyMarkup = buildSubPickerKeyboard(subs, "sel:edit")
+	if _, err := h.bot.Send(msg); err != nil {
+		log.Printf("bot: edit picker send user %d: %v", chatID, err)
+	}
+}
+
+// selEdit is invoked when the user taps a subscription in the edit picker.
+func (h *Handler) selEdit(chatID int64, msgID int, id int64) {
+	subs, err := h.subs.ListByUser(chatID)
+	if err != nil {
+		log.Printf("bot: sel_edit list subs user %d: %v", chatID, err)
+		h.editText(chatID, msgID, "Не удалось загрузить подписки.")
 		return
 	}
 
@@ -571,11 +693,11 @@ func (h *Handler) handleEdit(chatID int64, args string) {
 		}
 	}
 	if found == nil {
-		h.reply(chatID, fmt.Sprintf("Подписка #%d не найдена.", id))
+		h.editText(chatID, msgID, fmt.Sprintf("Подписка #%d не найдена.", id))
 		return
 	}
 	if found.Source == domain.SourceHabr {
-		h.reply(chatID, "У Habr-подписок нет настраиваемых фильтров.")
+		h.editText(chatID, msgID, "У Habr-подписок нет настраиваемых фильтров.")
 		return
 	}
 
@@ -583,6 +705,7 @@ func (h *Handler) handleEdit(chatID int64, args string) {
 		keyword:  found.Keyword,
 		filters:  found.Filters,
 		original: found,
+		msgID:    msgID,
 	}
 	h.states.Store(chatID, state)
 
@@ -596,16 +719,7 @@ func (h *Handler) handleEdit(chatID int64, args string) {
 			tgbotapi.NewInlineKeyboardButtonData("❌ Отмена", "wiz:setup:cancel"),
 		),
 	)
-	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ParseMode = tgbotapi.ModeHTML
-	msg.ReplyMarkup = kb
-
-	sent, err := h.bot.Send(msg)
-	if err != nil {
-		log.Printf("bot: edit wizard start: %v", err)
-		return
-	}
-	state.msgID = sent.MessageID
+	h.editWithKeyboard(chatID, msgID, text, kb)
 }
 
 func (h *Handler) handleStatus(chatID int64) {
@@ -627,6 +741,24 @@ func (h *Handler) handleStatus(chatID int64) {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+// buildSubPickerKeyboard builds an inline keyboard with one button per subscription.
+// action is the callback prefix, e.g. "sel:edit" or "sel:rm".
+func buildSubPickerKeyboard(subs []domain.Subscription, action string) tgbotapi.InlineKeyboardMarkup {
+	rows := make([][]tgbotapi.InlineKeyboardButton, 0, len(subs))
+	for _, s := range subs {
+		icon := "▶️"
+		if !s.Active {
+			icon = "⏸"
+		}
+		label := fmt.Sprintf("%s #%d %s (%s)", icon, s.ID, s.Keyword, s.Source)
+		cb := fmt.Sprintf("%s:%d", action, s.ID)
+		rows = append(rows, tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(label, cb),
+		))
+	}
+	return tgbotapi.NewInlineKeyboardMarkup(rows...)
+}
 
 func (h *Handler) reply(chatID int64, text string) {
 	msg := tgbotapi.NewMessage(chatID, text)
