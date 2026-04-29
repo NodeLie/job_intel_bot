@@ -42,10 +42,12 @@ func New(subs subscriptionLister, checker checker, interval time.Duration) *Sche
 func (s *Scheduler) Start() {
 	s.wg.Add(1)
 	go s.loop()
+	log.Printf("scheduler: started (interval: %s)", s.interval)
 }
 
 // Stop signals the polling loop to exit and waits for it to finish.
 func (s *Scheduler) Stop() {
+	log.Printf("scheduler: stopping")
 	close(s.stop)
 	s.wg.Wait()
 }
@@ -70,6 +72,7 @@ func (s *Scheduler) loop() {
 }
 
 func (s *Scheduler) runAll() {
+	log.Printf("scheduler: tick")
 	subs, err := s.subs.ListActive()
 	if err != nil {
 		log.Printf("scheduler: list active: %v", err)

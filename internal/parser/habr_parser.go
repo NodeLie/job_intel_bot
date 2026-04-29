@@ -2,6 +2,7 @@ package parser
 
 import (
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -34,6 +35,7 @@ func NewHabrParser(client *http.Client, query string) *HabrParser {
 
 // Parse fetches the listing page and then enriches each job with its description.
 func (p *HabrParser) Parse() ([]domain.Job, error) {
+	log.Printf("habr: GET %s", p.listURL())
 	doc, err := p.fetchDoc(p.listURL())
 	if err != nil {
 		return nil, fmt.Errorf("habr: fetch listing: %w", err)
@@ -44,6 +46,7 @@ func (p *HabrParser) Parse() ([]domain.Job, error) {
 		return nil, nil
 	}
 
+	log.Printf("habr: found %d vacancies, enriching descriptions", len(jobs))
 	sem := make(chan struct{}, maxConcurrentHabrFetches)
 	var mu sync.Mutex
 	var wg sync.WaitGroup

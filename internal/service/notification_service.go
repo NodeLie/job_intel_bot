@@ -47,6 +47,7 @@ func NewNotificationService(seen seenRepository, factory ParserFactory, notify n
 // CheckAndNotify fetches new vacancies for the given subscription and notifies the user.
 // Only jobs whose fingerprint was not seen before are delivered.
 func (s *NotificationService) CheckAndNotify(sub domain.Subscription) error {
+	log.Printf("service: sub %d user %d source %s query %q: checking", sub.ID, sub.UserID, sub.Source, sub.Keyword)
 	p, err := s.factory(sub)
 	if err != nil {
 		return fmt.Errorf("service: build parser for sub %d: %w", sub.ID, err)
@@ -71,12 +72,14 @@ func (s *NotificationService) CheckAndNotify(sub domain.Subscription) error {
 	}
 
 	if len(newJobs) == 0 {
+		log.Printf("service: sub %d user %d: no new jobs", sub.ID, sub.UserID)
 		return nil
 	}
 
 	if err := s.notify.Notify(sub.UserID, newJobs); err != nil {
 		return fmt.Errorf("service: notify sub %d: %w", sub.ID, err)
 	}
+	log.Printf("service: sub %d user %d: sent %d new jobs", sub.ID, sub.UserID, len(newJobs))
 
 	// mark as seen only after successful delivery
 	for _, j := range newJobs {
