@@ -3,6 +3,9 @@
 .idea/
 prompts
 CLAUDE.md
+AGENTS.md
 todo.md
 .env
 config.yaml
+seen_jobs.json
+subscriptions.json

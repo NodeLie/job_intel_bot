@@ -140,7 +140,7 @@ func buildParserFactory() service.ParserFactory {
 			return parser.NewHabrParser(client, sub.Keyword), nil
 		case domain.SourceHH:
 			f := sub.Filters
-			return parser.NewHHParser(client, sub.Keyword, atLeastOne(f.Pages), parser.HHFilters{
+			return parser.NewHHScraper(client, sub.Keyword, atLeastOne(f.Pages), parser.HHFilters{
 				Experience:     f.Experience,
 				WorkFormat:     f.WorkFormat,
 				Salary:         f.Salary,

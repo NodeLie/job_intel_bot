@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
+	"log"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -65,6 +66,7 @@ func (p *HHParser) Parse() ([]domain.Job, error) {
 		jobs[i] = p.toJob(v)
 	}
 
+	log.Printf("hh: fetched %d vacancies, enriching descriptions", len(jobs))
 	sem := make(chan struct{}, maxConcurrentHHFetches)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -173,6 +175,7 @@ func (p *HHParser) fetchList(page int) ([]hhVacancy, error) {
 	}
 
 	rawURL := hhAPIBase + "/vacancies?" + q.Encode()
+	log.Printf("hh: GET %s", rawURL)
 	resp, err := p.client.Get(rawURL)
 	if err != nil {
 		return nil, err
